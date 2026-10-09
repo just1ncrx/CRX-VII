@@ -1,0 +1,154 @@
+name: Fetch VII Files and Generate Webp
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # verhindert, dass zwei Laeufe gleichzeitig dieselbe Datei generieren/hochladen
+  group: fetch-vii
+  cancel-in-progress: false
+
+env:
+  # so viele WEBPs sollen im R2-Bucket max. gleichzeitig liegen
+  MAX_KEEP: 48
+  R2_PREFIX: vii
+
+jobs:
+  fetch_generate_deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Sicherheitsnetz, falls die Datei nie erscheint
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.VII_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE (letzter verfuegbarer 5-min-Slot, UTC)
+        id: set_run_date
+        run: |
+          # Das VII-Composite eines Slots erscheint erst NACH dem Slot.
+          # Aufruf um :35 -> :30 ist da, :25 -> :20, :15 -> :10, :10 -> :05
+          # => immer den Slot davor (aktueller 5-min-Slot minus 5 min) holen.
+          NOW=$(date -u +%s)
+          CURRENT_SLOT=$(( NOW / 300 * 300 ))
+          SLOT_EPOCH=$(( CURRENT_SLOT - 300 ))
+
+          TIME=$(date -u -d "@$SLOT_EPOCH" +%H%M)
+          DATE=$(date -u -d "@$SLOT_EPOCH" +%Y%m%d)
+          BERLIN_TIME=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%H%M)
+          BERLIN_DATE=$(TZ=Europe/Berlin date -d "@$SLOT_EPOCH" +%Y%m%d)
+
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "SLOT_EPOCH=$SLOT_EPOCH" >> $GITHUB_ENV
+          echo "BERLIN_TIME=$BERLIN_TIME" >> $GITHUB_ENV
+          echo "BERLIN_DATE=$BERLIN_DATE" >> $GITHUB_ENV
+          echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
+
+          echo "Datenslot UTC: ${DATE}_${TIME} | Berlin: ${BERLIN_DATE}_${BERLIN_TIME}"
+
+      - name: Download VII (mit Retry)
+        run: |
+          MAX_ATTEMPTS=50
+          SLEEP_SECONDS=5
+
+          OUT_DIR="data/vii"
+          mkdir -p "$OUT_DIR"
+          FILE_NAME="composite_VII_${DATE}_${TIME}-hd5"
+          URL="https://opendata.dwd.de/weather/radar/composite/vii/${FILE_NAME}"
+          OUT="${OUT_DIR}/${FILE_NAME}"
+          TMP_FILE="${RUNNER_TEMP}/${FILE_NAME}"
+
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            HTTP_CODE=$(curl -s -o "$TMP_FILE" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 120 "$URL" || echo "000")
+            if [ "$HTTP_CODE" = "200" ] && [ -s "$TMP_FILE" ]; then
+              mv "$TMP_FILE" "$OUT"
+              echo "[VII] Erfolgreich (Versuch $i/$MAX_ATTEMPTS): $OUT"
+              exit 0
+            fi
+            echo "[VII] Versuch $i/$MAX_ATTEMPTS: Datei noch nicht verfuegbar (HTTP $HTTP_CODE)."
+            rm -f "$TMP_FILE"
+            sleep "$SLEEP_SECONDS"
+          done
+
+          echo "::error::[VII] ${FILE_NAME} nach $MAX_ATTEMPTS Versuchen nicht verfuegbar - Abbruch."
+          exit 1
+
+      - name: Generate WEBP for VII
+        run: python scripts/generate_webp.py
+
+      - name: Download bestehende metadata.json aus R2 (falls vorhanden)
+        run: |
+          aws s3 cp \
+            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/metadata.json" \
+            ./metadata_prev.json \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com \
+            || echo "Keine bestehende metadata.json in R2 gefunden - starte frisch."
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Build metadata.json (mit bestehendem Stand mergen, auf ${{ env.MAX_KEEP }} Timesteps kuerzen)
+        run: |
+          python scripts/generate_metadata.py output \
+            --run "${{ steps.set_run_date.outputs.run }}" \
+            --date "$BERLIN_DATE" \
+            --existing ./metadata_prev.json \
+            --max-keep "$MAX_KEEP" \
+            --meta-out ./metadata.json \
+            --removed-out ./removed_files.txt
+
+      - name: Upload neue WEBP zu R2
+        run: |
+          aws s3 cp \
+            "output/vii/vii_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
+            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/vii_${BERLIN_DATE}_${BERLIN_TIME}.webp" \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Upload aktualisierte metadata.json zu R2
+        run: |
+          aws s3 cp \
+            ./metadata.json \
+            "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/metadata.json" \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Aus dem Fenster gefallene alte WEBPs aus R2 loeschen
+        run: |
+          if [ -s ./removed_files.txt ]; then
+            while IFS= read -r fname || [ -n "$fname" ]; do
+              [ -z "$fname" ] && continue
+              echo "Loesche $fname aus R2 ..."
+              aws s3 rm \
+                "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/$fname" \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            done < ./removed_files.txt
+          else
+            echo "Nichts zu loeschen - Fenster noch nicht voll oder unveraendert."
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
